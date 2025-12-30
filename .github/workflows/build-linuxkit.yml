@@ -34,20 +34,27 @@ jobs:
           echo "Generated manifest (first 200 lines):"
           sed -n '1,200p' actions-runner-docker.generated.yaml
 
-      - name: Build ISO with linuxkit (Docker)
+      - name: Build ISO with linuxkit
         id: build_iso
         run: |
           set -euo pipefail
           if ! command -v docker >/dev/null 2>&1; then
-            echo "Docker not installed on runner. This job requires Docker to be available."
+            echo "Docker not installed on runner. linuxkit requires Docker to build images; install Docker or use a self-hosted runner with Docker." >&2
             exit 1
           fi
+
           mkdir -p lxk-build-output
-          echo "Running linuxkit build in docker..."
-          docker run --rm --privileged \
-            -v "${{ github.workspace }}:/work" -w /work \
-            linuxkit/linuxkit:latest \
-            build -format iso-bios actions-runner-docker.generated.yaml
+
+          # Download linuxkit v1.8.2 for linux-amd64
+          URL=https://github.com/linuxkit/linuxkit/releases/download/v1.8.2/linuxkit-linux-amd64
+          echo "Downloading linuxkit from $URL"
+          curl -fsSL "$URL" -o linuxkit
+          chmod +x linuxkit
+          sudo mv linuxkit /usr/local/bin/linuxkit
+          echo "linuxkit version: $(linuxkit version || true)"
+
+          echo "Running linuxkit build..."
+          linuxkit build -format iso-bios actions-runner-docker.generated.yaml
 
           FILE=$(ls -1 *.iso 2>/dev/null | head -n1 || true)
           if [ -z "$FILE" ]; then
