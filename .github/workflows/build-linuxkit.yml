@@ -27,10 +27,14 @@ jobs:
       - name: Generate manifest with version
         run: |
           VERSION="${{ steps.read_version.outputs.version }}"
-          # Replace runner image tag with the version
+          # Replace ghcr-prefixed occurrences first
           sed -E "s|(ghcr.io/actions/actions-runner):[^[:space:]]+|\\1:${VERSION}|g" actions-runner-docker.yaml > actions-runner-docker.generated.yaml
+          # Replace un-prefixed actions/actions-runner:... with ghcr.io/actions/actions-runner:<version>
+          sed -E "s|(actions/actions-runner):[^[:space:]]+|ghcr.io/\\1:${VERSION}|g" -i actions-runner-docker.generated.yaml
           # Remove any top-level 'version:' key (not allowed in manifest)
           sed -i -E '/^version:[[:space:]]*/d' actions-runner-docker.generated.yaml
+          echo "Image-related lines after replacements:"
+          grep -nE 'actions/actions-runner|ghcr.io/actions/actions-runner|image:' actions-runner-docker.generated.yaml || true
           echo "Generated manifest (first 200 lines):"
           sed -n '1,200p' actions-runner-docker.generated.yaml
 
@@ -47,6 +51,15 @@ jobs:
           else
             echo "Warning: no GHCR credentials found; pulling images from ghcr.io may fail"
           fi
+
+      - name: Verify GHCR image pull
+        run: |
+          set -euo pipefail
+          VERSION=${{ steps.read_version.outputs.version }}
+          echo "Testing pull ghcr.io/actions/actions-runner:$VERSION"
+          docker pull ghcr.io/actions/actions-runner:$VERSION
+          echo "Optional check: try pull actions/actions-runner:$VERSION from Docker Hub (may fail)"
+          docker pull actions/actions-runner:$VERSION || true
 
       - name: Build ISO with linuxkit
         id: build_iso
