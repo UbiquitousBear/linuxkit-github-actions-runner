@@ -33,28 +33,46 @@ jobs:
           echo "Generated manifest (first 200 lines):"
           sed -n '1,200p' actions-runner-docker.generated.yaml
 
-      - name: Build ISO with linuxkit-builder action
-        uses: craigbougie/linuxkit-builder@v1
+      - name: Build ISO with vouch linuxkit action
+        id: linuxkit_build
+        uses: vouch-opensource/linuxkit-build@master
         with:
-          manifest: actions-runner-docker.generated.yaml
+          config: actions-runner-docker.generated.yaml
           format: iso-bios
-          output: actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+
+      - name: Locate and rename ISO
+        id: rename_iso
+        run: |
+          echo "Files from action output: '${{ steps.linuxkit_build.outputs.files }}'"
+          # Try to find an ISO file produced in the workspace
+          FILE=$(ls -1 *.iso 2>/dev/null | head -n1 || true)
+          if [ -z "$FILE" ]; then
+            FILE=$(echo "${{ steps.linuxkit_build.outputs.files }}" | tr ',' '\n' | grep -m1 '\.iso$' || true)
+          fi
+          if [ -z "$FILE" ]; then
+            echo "No ISO found from linuxkit build"
+            exit 1
+          fi
+          NEW=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          mv "$FILE" "$NEW"
+          echo "iso=$NEW" >> $GITHUB_OUTPUT
+          echo "Renamed $FILE -> $NEW"
 
       - name: Verify ISO exists
         run: |
-          ISO=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          ISO=${{ steps.rename_iso.outputs.iso }}
           ls -la "$ISO" || (echo "No ISO produced: $ISO" && exit 1)
 
       - name: Smoke test ISO
         run: |
-          ISO=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          ISO=${{ steps.rename_iso.outputs.iso }}
           # Show basic info about the produced ISO for debugging
           file "$ISO" || true
           ls -lh "$ISO"
 
       - name: Create Containerfile
         run: |
-          ISO=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          ISO=${{ steps.rename_iso.outputs.iso }}
           cat > Containerfile <<EOF
           FROM scratch
           COPY $ISO /disk/
@@ -80,4 +98,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linuxkit-iso-${{ steps.read_version.outputs.version }}
-          path: "actions-runner-docker-${{ steps.read_version.outputs.version }}.iso"
+          path: "${{ steps.rename_iso.outputs.iso }}"
