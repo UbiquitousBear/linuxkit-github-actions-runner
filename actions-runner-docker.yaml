@@ -123,6 +123,3 @@ services:
           ls -la /runner-token/
           exit 1
         fi
-
-outputs:
-  - format: iso-bios

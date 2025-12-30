@@ -27,9 +27,10 @@ jobs:
       - name: Generate manifest with version
         run: |
           VERSION="${{ steps.read_version.outputs.version }}"
-          # Prepend a top-level version key and replace runner image tag with the version
-          printf "version: %s\n" "$VERSION" > actions-runner-docker.generated.yaml
-          sed -E "s|(ghcr.io/actions/actions-runner):[^[:space:]]+|\\1:${VERSION}|g" actions-runner-docker.yaml >> actions-runner-docker.generated.yaml
+          # Replace runner image tag with the version
+          sed -E "s|(ghcr.io/actions/actions-runner):[^[:space:]]+|\\1:${VERSION}|g" actions-runner-docker.yaml > actions-runner-docker.generated.yaml
+          # Remove any top-level 'version:' key (not allowed in manifest)
+          sed -i -E '/^version:[[:space:]]*/d' actions-runner-docker.generated.yaml
           echo "Generated manifest (first 200 lines):"
           sed -n '1,200p' actions-runner-docker.generated.yaml
 
