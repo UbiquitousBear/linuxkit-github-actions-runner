@@ -1,0 +1,83 @@
+name: Build LinuxKit Images
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build LinuxKit manifest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read runner version
+        id: read_version
+        run: |
+          echo "version=$(cat version.yaml)" >> $GITHUB_OUTPUT
+
+      - name: Generate manifest with version
+        run: |
+          VERSION="${{ steps.read_version.outputs.version }}"
+          # Prepend a top-level version key and replace runner image tag with the version
+          printf "version: %s\n" "$VERSION" > actions-runner-docker.generated.yaml
+          sed -E "s|(ghcr.io/actions/actions-runner):[^[:space:]]+|\\1:${VERSION}|g" actions-runner-docker.yaml >> actions-runner-docker.generated.yaml
+          echo "Generated manifest (first 200 lines):"
+          sed -n '1,200p' actions-runner-docker.generated.yaml
+
+      - name: Build ISO with linuxkit-builder action
+        uses: craigbougie/linuxkit-builder@v1
+        with:
+          manifest: actions-runner-docker.generated.yaml
+          format: iso-bios
+          output: actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+
+      - name: Verify ISO exists
+        run: |
+          ISO=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          ls -la "$ISO" || (echo "No ISO produced: $ISO" && exit 1)
+
+      - name: Smoke test ISO
+        run: |
+          ISO=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          # Show basic info about the produced ISO for debugging
+          file "$ISO" || true
+          ls -lh "$ISO"
+
+      - name: Create Containerfile
+        run: |
+          ISO=actions-runner-docker-${{ steps.read_version.outputs.version }}.iso
+          cat > Containerfile <<EOF
+          FROM scratch
+          COPY $ISO /disk/
+          EOF
+
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push containerDisk image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/linuxkit-runner:${{ steps.read_version.outputs.version }},ghcr.io/${{ github.repository_owner }}/linuxkit-runner:${{ github.sha }},ghcr.io/${{ github.repository_owner }}/linuxkit-runner:latest
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linuxkit-iso-${{ steps.read_version.outputs.version }}
+          path: "actions-runner-docker-${{ steps.read_version.outputs.version }}.iso"

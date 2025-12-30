@@ -1,0 +1,128 @@
+kernel:
+  image: linuxkit/kernel:6.6.13
+  cmdline: "console=ttyS0 console=tty0"
+
+init:
+  - linuxkit/init:v1.0.1
+  - linuxkit/runc:v1.0.3
+  - linuxkit/containerd:v2.0.0-rc.3
+
+onboot:
+  # Mount the virtiofs filesystem containing the jitconfig
+  - name: mount-runner-token
+    image: alpine:3.21
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /runner-token
+        for i in $(seq 1 30); do
+          if mount -t virtiofs runner-token /runner-token 2>/dev/null; then
+            echo "Mounted runner-token virtiofs"
+            break
+          fi
+          echo "Waiting for virtiofs... ($i/30)"
+          sleep 1
+        done
+    capabilities:
+      - CAP_SYS_ADMIN
+    rootfsPropagation: shared
+    binds:
+      - /runner-token:/runner-token:rshared
+
+  # Format and mount the ephemeral work disk (/dev/vda)
+  - name: mount-workdir
+    image: alpine:3.21
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # Wait for the virtio disk
+        for i in $(seq 1 30); do
+          if [ -b /dev/vda ]; then
+            echo "Found work disk at /dev/vda"
+            break
+          fi
+          echo "Waiting for work disk... ($i/30)"
+          sleep 1
+        done
+        
+        # Format and mount
+        mkfs.ext4 -F -q /dev/vda
+        mkdir -p /work
+        mount /dev/vda /work
+        
+        # Create directory structure for runner and docker
+        mkdir -p /work/_work /work/_diag /work/docker
+        chmod 755 /work/_work /work/_diag /work/docker
+        
+        echo "Work directory ready at /work"
+    capabilities:
+      - CAP_SYS_ADMIN
+    rootfsPropagation: shared
+    binds:
+      - /dev:/dev
+      - /work:/work:rshared
+
+  # Setup networking
+  - name: dhcp
+    image: linuxkit/dhcpcd:v1.0.1
+    command: ["/sbin/dhcpcd", "--nobackground", "-f", "/dhcpcd.conf", "-1"]
+
+services:
+  # Docker daemon - stores data on ephemeral disk
+  - name: docker
+    image: docker:27.0-dind
+    capabilities:
+      - all
+    net: host
+    pid: host
+    binds:
+      - /var/run:/var/run
+      - /work/docker:/var/lib/docker
+    rootfsPropagation: shared
+    env:
+      - DOCKER_DRIVER=overlay2
+
+  # GitHub Actions runner
+  - name: github-runner
+    image: ghcr.io/actions/actions-runner:latest
+    net: host
+    capabilities:
+      - CAP_NET_ADMIN
+    binds:
+      - /runner-token:/runner-token:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /work/_work:/home/runner/_work
+      - /work/_diag:/home/runner/_diag
+    env:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - RUNNER_WORKDIR=/home/runner/_work
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # Wait for docker
+        for i in $(seq 1 60); do
+          if docker info >/dev/null 2>&1; then
+            echo "Docker is ready"
+            break
+          fi
+          echo "Waiting for docker... ($i/60)"
+          sleep 1
+        done
+        
+        # Read jitconfig and start runner
+        if [ -f /runner-token/jitconfig ]; then
+          JITCONFIG=$(cat /runner-token/jitconfig)
+          echo "Starting runner with jitconfig"
+          cd /home/runner
+          exec ./run.sh --jitconfig "$JITCONFIG"
+        else
+          echo "ERROR: jitconfig not found"
+          ls -la /runner-token/
+          exit 1
+        fi
+
+outputs:
+  - format: iso-bios
