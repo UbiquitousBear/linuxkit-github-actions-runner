@@ -34,6 +34,20 @@ jobs:
           echo "Generated manifest (first 200 lines):"
           sed -n '1,200p' actions-runner-docker.generated.yaml
 
+      - name: Login to GHCR for pulls
+        run: |
+          set -euo pipefail
+          echo "Attempting to log in to ghcr.io (required if manifest references ghcr.io images)"
+          if [ -n "${{ secrets.GHCR_TOKEN }}" ]; then
+            echo "Using GHCR_TOKEN"
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          elif [ -n "${{ secrets.GITHUB_TOKEN }}" ]; then
+            echo "Using GITHUB_TOKEN (may not have package read permission for ghcr.io resources outside the repo/org)"
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          else
+            echo "Warning: no GHCR credentials found; pulling images from ghcr.io may fail"
+          fi
+
       - name: Build ISO with linuxkit
         id: build_iso
         run: |
