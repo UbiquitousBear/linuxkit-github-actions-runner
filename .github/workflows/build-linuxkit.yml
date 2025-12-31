@@ -63,36 +63,61 @@ jobs:
           sudo mv linuxkit /usr/local/bin/linuxkit
           echo "linuxkit version: $(linuxkit version || true)"
 
-          echo "Running linuxkit build..."
-          linuxkit build --format iso-bios actions-runner-docker.generated.yaml
+          echo "Running linuxkit build (kernel+initrd)..."
+          linuxkit build --format kernel+initrd actions-runner-docker.generated.yaml
 
-          FILE=$(ls -1 *.iso 2>/dev/null | head -n1 || true)
-          if [ -z "$FILE" ]; then
-            echo "No ISO found from linuxkit build"
+          # Locate produced kernel/initrd files
+          KERNEL_FILE=$(ls -1 kernel* 2>/dev/null | head -n1 || true)
+          INITRD_FILE=$(ls -1 initrd* 2>/dev/null | head -n1 || true)
+
+          if [ -z "$KERNEL_FILE" ] && [ -z "$INITRD_FILE" ]; then
+            # Try more general search
+            KERNEL_FILE=$(ls -1 *kernel* 2>/dev/null | head -n1 || true)
+            INITRD_FILE=$(ls -1 *initrd* 2>/dev/null | head -n1 || true)
+          fi
+
+          if [ -z "$KERNEL_FILE" ] || [ -z "$INITRD_FILE" ]; then
+            echo "Did not find both kernel and initrd files from linuxkit build"
+            echo "Found kernel: $KERNEL_FILE"
+            echo "Found initrd: $INITRD_FILE"
+            echo "Current directory listing:"
+            ls -la
             exit 1
           fi
-          mv "$FILE" lxk-build-output/actions-runner-docker.generated.iso
-          echo "iso=lxk-build-output/actions-runner-docker.generated.iso" >> $GITHUB_OUTPUT
+
+          KOUT=lxk-build-output/actions-runner-docker.generated.kernel
+          IOUT=lxk-build-output/actions-runner-docker.generated.initrd
+          mv "$KERNEL_FILE" "$KOUT"
+          mv "$INITRD_FILE" "$IOUT"
+          echo "kernel=$KOUT" >> $GITHUB_OUTPUT
+          echo "initrd=$IOUT" >> $GITHUB_OUTPUT
           ls -la lxk-build-output
 
-      - name: Verify ISO exists
+      - name: Verify kernel/initrd exist
         run: |
-          ISO=${{ steps.build_iso.outputs.iso }}
-          ls -la "$ISO" || (echo "No ISO produced: $ISO" && exit 1)
+          KERNEL=${{ steps.build_iso.outputs.kernel }}
+          INITRD=${{ steps.build_iso.outputs.initrd }}
+          ls -la "$KERNEL" || (echo "No kernel produced: $KERNEL" && exit 1)
+          ls -la "$INITRD" || (echo "No initrd produced: $INITRD" && exit 1)
 
-      - name: Smoke test ISO
+      - name: Smoke test kernel/initrd
         run: |
-          ISO=${{ steps.build_iso.outputs.iso }}
-          # Show basic info about the produced ISO for debugging
-          file "$ISO" || true
-          ls -lh "$ISO"
+          KERNEL=${{ steps.build_iso.outputs.kernel }}
+          INITRD=${{ steps.build_iso.outputs.initrd }}
+          # Show basic info about the produced files for debugging
+          file "$KERNEL" || true
+          ls -lh "$KERNEL"
+          file "$INITRD" || true
+          ls -lh "$INITRD"
 
       - name: Create Containerfile
         run: |
-          ISO=${{ steps.build_iso.outputs.iso }}
+          KERNEL=${{ steps.build_iso.outputs.kernel }}
+          INITRD=${{ steps.build_iso.outputs.initrd }}
           cat > Containerfile <<EOF
           FROM scratch
-          COPY $ISO /disk/
+          COPY $KERNEL /disk/
+          COPY $INITRD /disk/
           EOF
 
       - name: Login to GHCR
@@ -109,10 +134,12 @@ jobs:
           context: .
           file: ./Containerfile
           push: true
-          tags: ghcr.io/${{ steps.owner.outputs.owner }}/linuxkit-runner:${{ steps.read_version.outputs.version }},ghcr.io/${{ steps.owner.outputs.owner }}/linuxkit-runner:${{ github.sha }},ghcr.io/${{ steps.owner.outputs.owner }}/linuxkit-runner:latest
+          tags: ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:${{ steps.read_version.outputs.version }},ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:${{ github.sha }},ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:latest
 
-      - name: Upload ISO artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linuxkit-iso-${{ steps.read_version.outputs.version }}
-          path: "${{ steps.build_iso.outputs.iso }}"
+          name: linuxkit-docker-${{ steps.read_version.outputs.version }}
+          path: |
+            ${{ steps.build_iso.outputs.kernel }}
+            ${{ steps.build_iso.outputs.initrd }}
