@@ -1,0 +1,208 @@
+kernel:
+  image: linuxkit/kernel:6.12.59
+  cmdline: "console=ttyS0 console=tty0 quiet loglevel=3 net.ifnames=0 biosdevname=0"
+
+init:
+  - linuxkit/init:b5506cc74a6812dc40982cacfd2f4328f8a4b12a
+  - linuxkit/runc:9442aa234715e751a16144f1d4ae3fd1a00fd492
+  - linuxkit/containerd:ba19f64efd3331a8fd0a33e00eabd14f6ee1780e
+  - linuxkit/ca-certificates:256f1950df59f2f209e9f0b81374177409eb11de
+
+onboot:
+  - name: mount-runner-token
+    image: alpine:3.21
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /runner-token
+        for i in $(seq 1 30); do
+          if mount -t virtiofs runner-token /runner-token 2>/dev/null; then
+            echo "Mounted runner-token virtiofs"
+            break
+          fi
+          echo "Waiting for virtiofs... ($i/30)"
+          sleep 1
+        done
+    capabilities: [CAP_SYS_ADMIN]
+    rootfsPropagation: shared
+    binds:
+      - /runner-token:/runner-token:rshared
+
+  - name: mount-workdir
+    image: alpine:3.21
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        for i in $(seq 1 30); do
+          if [ -b /dev/vda ]; then
+            echo "Found work disk at /dev/vda"
+            break
+          fi
+          echo "Waiting for work disk... ($i/30)"
+          sleep 1
+        done
+
+        mkfs.ext4 -F -q /dev/vda
+        mkdir -p /work
+        mount /dev/vda /work
+
+        mkdir -p /work/runner /work/_work /work/_diag /work/docker /work/tmp
+        chmod 755 /work/runner /work/_work /work/_diag /work/docker /work/tmp
+        echo "Work directory ready at /work"
+    capabilities: [CAP_SYS_ADMIN]
+    rootfsPropagation: shared
+    binds:
+      - /dev:/dev
+      - /work:/work:rshared
+      
+  - name: harden-proc
+    image: alpine:3.21
+    capabilities: [CAP_SYS_ADMIN]
+    binds:
+      - /proc:/proc
+      - /sys:/sys
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mount -o remount,hidepid=2 /proc 2>/dev/null || true
+        sysctl -w kernel.yama.ptrace_scope=3 2>/dev/null || true
+        sysctl -w kernel.kptr_restrict=2 2>/dev/null || true
+        echo "proc hardening applied (best-effort)"
+
+  # Networking
+  - name: dhcp
+    image: linuxkit/dhcpcd:b87e9ececac55a65eaa592f4dd8b4e0c3009afdb
+    command: ["/sbin/dhcpcd", "--nobackground", "-f", "/dhcpcd.conf", "-1"]
+
+services:
+  - name: docker
+    image: docker:29-dind
+    capabilities: [all]
+    net: host
+    pid: host
+    rootfsPropagation: shared
+    binds:
+      - /var/run:/var/run
+      - /work/docker:/var/lib/docker
+    env:
+      - DOCKER_DRIVER=overlay2
+
+  - name: runner-coordinator
+    image: docker:29-cli
+    net: host
+    pid: host
+    rootfsPropagation: shared
+    binds:
+      - /runner-token:/runner-token:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /work:/work:rshared
+    env:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+
+        for i in $(seq 1 90); do
+          if docker info >/dev/null 2>&1; then
+            echo "Docker is ready"
+            break
+          fi
+          echo "Waiting for docker... ($i/90)"
+          sleep 1
+        done
+        docker info >/dev/null 2>&1 || { echo "ERROR: docker not ready"; exit 1; }
+
+        for f in runner-image jitconfig; do
+          if [ ! -f "/runner-token/$f" ]; then
+            echo "ERROR: /runner-token/$f missing"
+            ls -la /runner-token || true
+            exit 1
+          fi
+        done
+
+        RUNNER_IMAGE="$(tr -d '\r\n' < /runner-token/runner-image)"
+        echo "Runner image: ${RUNNER_IMAGE}"
+
+        # Prefer pinned runner version from GH.com releases
+        if [ -f /runner-token/runner-version ]; then
+          RUNNER_VERSION="$(tr -d '\r\n' < /runner-token/runner-version)"
+          RUNNER_TARBALL_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+          echo "Runner version: ${RUNNER_VERSION} (GH.com releases)"
+        elif [ -f /runner-token/runner-tarball-url ]; then
+          RUNNER_TARBALL_URL="$(tr -d '\r\n' < /runner-token/runner-tarball-url)"
+          echo "Runner tarball URL: injected (not printing)"
+        else
+          echo "ERROR: need /runner-token/runner-version or /runner-token/runner-tarball-url"
+          ls -la /runner-token || true
+          exit 1
+        fi
+
+        ( docker pull "${RUNNER_IMAGE}" ) & PULL_PID=$!
+        ( wget -qO /work/tmp/runner.tgz "${RUNNER_TARBALL_URL}" ) & DL_PID=$!
+
+        wait $PULL_PID
+        wait $DL_PID
+
+        if [ -f /runner-token/runner-sha256 ]; then
+          SHA="$(tr -d '\r\n' < /runner-token/runner-sha256)"
+          echo "${SHA}  /work/tmp/runner.tgz" | sha256sum -c -
+          echo "Runner tarball SHA256 verified"
+        fi
+
+        rm -rf /work/runner/*
+        tar -xzf /work/tmp/runner.tgz -C /work/runner
+        rm -f /work/tmp/runner.tgz
+
+        # One-time jitconfig file (host side); NOT mounted from /runner-token into the container
+        umask 077
+        cp /runner-token/jitconfig /work/tmp/jitconfig
+        chmod 600 /work/tmp/jitconfig
+
+        docker run --rm \
+          --name github-runner \
+          --network host \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -v /work/runner:/opt/actions-runner \
+          -v /work/_work:/__w \
+          -v /work/_diag:/_diag \
+          -v /work/tmp:/tmp/host-tmp \
+          --entrypoint /bin/bash \
+          "${RUNNER_IMAGE}" -lc '
+            set -euo pipefail
+
+            # Create two users: runnerd for runner daemon, runner for (future) job separation.
+            if ! id runnerd >/dev/null 2>&1; then
+              useradd -m -u 1000 -s /bin/bash runnerd
+            fi
+            if ! id runner >/dev/null 2>&1; then
+              useradd -m -u 1001 -s /bin/bash runner
+            fi
+
+            mkdir -p /__w /_diag /opt/actions-runner
+            chown -R 1000:1000 /__w /_diag /opt/actions-runner || true
+
+            # Read jitconfig then delete immediately
+            JITCONFIG_FILE="/tmp/host-tmp/jitconfig"
+            [ -f "$JITCONFIG_FILE" ] || { echo "ERROR: jitconfig missing"; exit 1; }
+            JITCONFIG="$(cat "$JITCONFIG_FILE")"
+            rm -f "$JITCONFIG_FILE" || true
+
+            # Start runner as runnerd. Note: stock runner executes job steps as the same OS user.
+            exec su -s /bin/bash runnerd -c "
+              set -euo pipefail
+              cd /opt/actions-runner
+              export RUNNER_WORKDIR=/__w
+              ./run.sh --jitconfig \"$JITCONFIG\"
+            "
+          '
+
+        rm -f /work/tmp/jitconfig || true
+        poweroff -f || true
