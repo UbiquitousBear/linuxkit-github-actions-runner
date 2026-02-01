@@ -50,15 +50,15 @@ onboot:
         mkdir -p /work
         mount /dev/vda /work
 
-        mkdir -p /work/runner /work/_work /work/_diag /work/docker /work/tmp
-        chmod 755 /work/runner /work/_work /work/_diag /work/docker /work/tmp
+        mkdir -p /work/runner /work/_work /work/_diag /work/tmp /work/docker
+        chmod 755 /work/runner /work/_work /work/_diag /work/tmp /work/docker
         echo "Work directory ready at /work"
     capabilities: [CAP_SYS_ADMIN]
     rootfsPropagation: shared
     binds:
       - /dev:/dev
       - /work:/work:rshared
-      
+
   - name: harden-proc
     image: alpine:3.21
     capabilities: [CAP_SYS_ADMIN]
@@ -75,51 +75,50 @@ onboot:
         sysctl -w kernel.kptr_restrict=2 2>/dev/null || true
         echo "proc hardening applied (best-effort)"
 
-  # Networking
+  # Networking (egress only; KubeVirt DHCP is typically fast)
   - name: dhcp
     image: linuxkit/dhcpcd:b87e9ececac55a65eaa592f4dd8b4e0c3009afdb
     command: ["/sbin/dhcpcd", "--nobackground", "-f", "/dhcpcd.conf", "-1"]
 
 services:
-  - name: docker
+  - name: dind-runner
     image: docker:29-dind
     capabilities: [all]
     net: host
     pid: host
     rootfsPropagation: shared
     binds:
-      - /var/run:/var/run
-      - /work/docker:/var/lib/docker
-    env:
-      - DOCKER_DRIVER=overlay2
-
-  - name: runner-coordinator
-    image: docker:29-cli
-    net: host
-    pid: host
-    rootfsPropagation: shared
-    binds:
       - /runner-token:/runner-token:ro
-      - /var/run/docker.sock:/var/run/docker.sock
       - /work:/work:rshared
+      - /var/run:/var/run:rshared
+      - /sys/fs/cgroup:/sys/fs/cgroup:rshared
     env:
-      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DOCKER_TLS_CERTDIR=
+      - DOCKER_DRIVER=overlay2
     command:
       - /bin/sh
-      - -c
+      - -lc
       - |
-        set -eu
+        set -euo pipefail
 
-        for i in $(seq 1 90); do
+        echo "== starting dockerd (host daemon) =="
+        dockerd \
+          --host=unix:///var/run/docker.sock \
+          --data-root=/work/docker \
+          --storage-driver=overlay2 \
+          --log-driver=json-file --log-opt max-size=10m --log-opt max-file=3 \
+          >/work/_diag/dockerd.log 2>&1 &
+
+        for i in $(seq 1 180); do
           if docker info >/dev/null 2>&1; then
-            echo "Docker is ready"
+            echo "Docker daemon ready"
             break
           fi
-          echo "Waiting for docker... ($i/90)"
-          sleep 1
+          sleep 0.25
         done
-        docker info >/dev/null 2>&1 || { echo "ERROR: docker not ready"; exit 1; }
+        docker info >/dev/null 2>&1 || { echo "ERROR: docker did not become ready"; tail -n 200 /work/_diag/dockerd.log || true; exit 1; }
 
+        echo "== validate injected inputs =="
         for f in runner-image jitconfig; do
           if [ ! -f "/runner-token/$f" ]; then
             echo "ERROR: /runner-token/$f missing"
@@ -131,7 +130,6 @@ services:
         RUNNER_IMAGE="$(tr -d '\r\n' < /runner-token/runner-image)"
         echo "Runner image: ${RUNNER_IMAGE}"
 
-        # Prefer pinned runner version from GH.com releases
         if [ -f /runner-token/runner-version ]; then
           RUNNER_VERSION="$(tr -d '\r\n' < /runner-token/runner-version)"
           RUNNER_TARBALL_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
@@ -145,6 +143,7 @@ services:
           exit 1
         fi
 
+        echo "== pull runner image + download runner tarball (parallel) =="
         ( docker pull "${RUNNER_IMAGE}" ) & PULL_PID=$!
         ( wget -qO /work/tmp/runner.tgz "${RUNNER_TARBALL_URL}" ) & DL_PID=$!
 
@@ -157,45 +156,48 @@ services:
           echo "Runner tarball SHA256 verified"
         fi
 
+        echo "== extract actions runner into /work/runner =="
         rm -rf /work/runner/*
         tar -xzf /work/tmp/runner.tgz -C /work/runner
         rm -f /work/tmp/runner.tgz
 
-        # One-time jitconfig file (host side); NOT mounted from /runner-token into the container
+        echo "== stage jitconfig (one-time) =="
         umask 077
         cp /runner-token/jitconfig /work/tmp/jitconfig
         chmod 600 /work/tmp/jitconfig
 
+        echo "== start runner container =="
+        # Workflows use the VM's dockerd via mounted docker.sock.
         docker run --rm \
           --name github-runner \
           --network host \
           -v /var/run/docker.sock:/var/run/docker.sock \
-          -v /work/runner:/opt/actions-runner \
-          -v /work/_work:/__w \
-          -v /work/_diag:/_diag \
-          -v /work/tmp:/tmp/host-tmp \
+          -v /work/runner:/opt/actions-runner:rw \
+          -v /work/_work:/__w:rw \
+          -v /work/_diag:/_diag:rw \
+          -v /work/tmp:/tmp/host-tmp:rw \
           --entrypoint /bin/bash \
           "${RUNNER_IMAGE}" -lc '
             set -euo pipefail
 
-            # Create two users: runnerd for runner daemon, runner for (future) job separation.
+            # Create a dedicated daemon user for the runner processes (to enforce runner users)
             if ! id runnerd >/dev/null 2>&1; then
               useradd -m -u 1000 -s /bin/bash runnerd
-            fi
-            if ! id runner >/dev/null 2>&1; then
-              useradd -m -u 1001 -s /bin/bash runner
             fi
 
             mkdir -p /__w /_diag /opt/actions-runner
             chown -R 1000:1000 /__w /_diag /opt/actions-runner || true
 
-            # Read jitconfig then delete immediately
+            # Read jitconfig then delete immediately (so it isn't left on disk)
             JITCONFIG_FILE="/tmp/host-tmp/jitconfig"
             [ -f "$JITCONFIG_FILE" ] || { echo "ERROR: jitconfig missing"; exit 1; }
             JITCONFIG="$(cat "$JITCONFIG_FILE")"
             rm -f "$JITCONFIG_FILE" || true
 
-            # Start runner as runnerd. Note: stock runner executes job steps as the same OS user.
+            # Sanity: ensure docker is reachable
+            docker info >/dev/null 2>&1 || { echo "ERROR: docker socket not usable"; exit 1; }
+
+            # Start runner as runnerd
             exec su -s /bin/bash runnerd -c "
               set -euo pipefail
               cd /opt/actions-runner
@@ -204,5 +206,8 @@ services:
             "
           '
 
+        echo "== cleanup =="
         rm -f /work/tmp/jitconfig || true
+
+        echo "== poweroff =="
         poweroff -f || true
