@@ -115,12 +115,12 @@ jobs:
           context: .
           file: ./Containerfile
           push: true
-          tags: ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:${{ steps.read_version.outputs.version }},ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:${{ github.sha }},ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:latest
+          tags: ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:${{ github.sha }},ghcr.io/${{ steps.owner.outputs.owner }}/runner-docker:latest
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linuxkit-docker-${{ steps.read_version.outputs.version }}
+          name: linuxkit-docker-${{ github.sha }}
           path: |
             ${{ steps.build_iso.outputs.kernel }}
             ${{ steps.build_iso.outputs.initrd }}
